@@ -24,12 +24,12 @@ class Config:
     SKEW_FACTOR = 4.0
     
     # Alpha & Aggressive
-    ALPHA_AGGR_THRESHOLD = 2.5
+    ALPHA_AGGR_THRESHOLD = 1.0 # Lowered for more frequent fills
     
     # Cross-Asset Alpha (Lead-Lag)
     CORR_WINDOW = 10
-    CORR_THRESHOLD = 0.0001 # 1 tick move in % terms roughly
-    LEAD_LAG_WEIGHT = 0.3 # How much to push fair price based on lead asset
+    CORR_THRESHOLD = 0.00005 # More sensitive
+    LEAD_LAG_WEIGHT = 0.5 
     
     # Volatility & Liquidity
     VOLA_EMA_ALPHA = 0.1
@@ -168,18 +168,26 @@ class Trader:
                 result[product] = orders
                 continue
 
-            # 6. Execution: Passive Quoting
+            # 6. Execution: Competitive Quoting
             bid_price = int(math.floor(fair + skew - dynamic_spread / 2.0))
             ask_price = int(math.ceil(fair + skew + dynamic_spread / 2.0))
             
-            bid_price = min(bid_price, best_bid)
-            ask_price = max(ask_price, best_ask)
+            # BE COMPETITIVE: Try to match the best bid/ask to ensure fills
+            # In a competitive market, being 1 tick off means 0 fills.
+            bid_price = max(bid_price, best_bid)
+            ask_price = min(ask_price, best_ask)
+            
+            # Final sanity check: don't cross the spread unless alpha is high
+            if abs(corr_alpha_signal) < 0.5:
+                bid_price = min(bid_price, best_ask - 1)
+                ask_price = max(ask_price, best_bid + 1)
             
             can_buy = limit - pos
             can_sell = -(limit + pos)
             
-            if can_buy > 0: orders.append(Order(product, bid_price, min(can_buy, 15)))
-            if can_sell < 0: orders.append(Order(product, ask_price, max(can_sell, -15)))
+            # MM Quotes: Slightly larger slices
+            if can_buy > 0: orders.append(Order(product, bid_price, min(can_buy, 25)))
+            if can_sell < 0: orders.append(Order(product, ask_price, max(can_sell, -25)))
                 
             # 7. Value-Based Alpha (Aggressive)
             # Trigger aggressive trade if lead-lag signal is strong
