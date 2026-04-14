@@ -5,14 +5,14 @@ from typing import Dict, List, Optional, Tuple, Any
 from datamodel import Order, OrderDepth, TradingState, Listing
 
 class Config:
-    """Tunable parameters for the Optimized Market Maker V8 Strategy."""
+    """Tunable parameters for Fixed Market Maker V8 (Stabilized)."""
     POSITION_LIMITS = {"TOMATOES": 250, "EMERALDS": 20}
     DEFAULT_LIMIT = 20
     
-    # Relaxed Thresholds for Edge-Based Quoting
-    STRONG_THRESHOLD = 1.2 # Lowered from 1.5
-    WEAK_THRESHOLD = 0.3   # Lowered from 0.5
-    EDGE_SCALE = 2.5       
+    # Thresholds for Edge-Based Quoting
+    STRONG_THRESHOLD = 1.0 
+    WEAK_THRESHOLD = 0.2
+    EDGE_SCALE = 2.0       
     
     # Fair Value & Microstructure
     MICRO_ADJUSTMENT_K = 0.8
@@ -21,26 +21,23 @@ class Config:
     
     # Spreads & Quoting
     BASE_SPREAD = {"TOMATOES": 4, "EMERALDS": 2}
-    MIN_SPREAD = 2
-    MAX_SPREAD = 40
     
-    # Inventory Management
-    LIQUIDATION_THRESHOLD = 0.8 # 80% of limit
-    SKEW_FACTOR = 4.0
+    # Regime & Trend (NERFED)
+    TREND_THRESHOLD = 1.5           
+    TREND_WEIGHT_NERFED = 0.2       # Reduced from 0.4
     
-    # Alpha & Aggressive
-    ALPHA_AGGR_VALUE_THRESHOLD = 1.5 # Lowered from 2.0
-    MOMENTUM_AGGR_THRESHOLD = 0.5    # New threshold for trend-based aggression
+    # Inventory Management (STRENGTHENED)
+    LIQUIDATION_THRESHOLD = 0.5     # 50% limit - more aggressive flattening
+    SKEW_FACTOR = 8.0               # Doubled from 4.0
+    
+    # Aggression Thresholds
+    ALPHA_AGGR_THRESHOLD = 1.5
+    SEMI_AGGR_TREND_THRESHOLD = 1.0
     
     # Execution Size
-    BASE_ORDER_SIZE = 25
-    MIN_ORDER_SIZE = 3     # Size floor
-    CONFIDENCE_FLOOR = 0.3 # Minimum confidence
-    
-    # Volatility Guard
-    VOL_GUARD_THRESHOLD = 1.8
-    VOL_PENALTY_FACTOR = 1.5
-    VOL_SIZE_REDUCTION = 0.8 # Less aggressive reduction (kept mostly intact)
+    BASE_ORDER_SIZE = 30
+    MIN_ORDER_SIZE = 5
+    CONFIDENCE_FLOOR = 0.3
 
 class StateManager:
     def __init__(self):
@@ -50,7 +47,7 @@ class StateManager:
 
     def update(self, product: str, mid: float):
         if product not in self.mid_history:
-            self.mid_history[product] = collections.deque(maxlen=10)
+            self.mid_history[product] = collections.deque(maxlen=20)
             self.vola_ema[product] = 0.0
             self.last_prices[product] = mid
         self.mid_history[product].append(mid)
@@ -58,10 +55,10 @@ class StateManager:
         self.vola_ema[product] = (0.1 * diff) + (0.9 * self.vola_ema[product])
         self.last_prices[product] = mid
 
-    def get_momentum(self, product: str) -> float:
+    def get_trend(self, product: str) -> float:
         history = self.mid_history.get(product)
-        if not history or len(history) < 2: return 0.0
-        return history[-1] - history[-2]
+        if not history or len(history) < 6: return 0.0
+        return history[-1] - history[-6]
 
 class Trader:
     POSITION_LIMITS = Config.POSITION_LIMITS
@@ -88,87 +85,71 @@ class Trader:
             
             vwap, imbalance = self._get_ob_stats(depth)
             
-            # --- 1. Fair Price & Edge ---
+            # --- 1. Fair Price & Limited Alpha ---
             if product == "EMERALDS":
                 fair = 10000.0
             else:
                 fair = vwap + (Config.MICRO_ADJUSTMENT_K * imbalance)
             
-            edge = fair - mid
-            momentum = self.state.get_momentum(product)
+            # NERFED Trend Influence
+            trend = self.state.get_trend(product)
+            enhanced_edge = (fair - mid) + (Config.TREND_WEIGHT_NERFED * trend)
+            
+            # --- 2. Sizing ---
             vol = self.state.vola_ema.get(product, 0.0)
+            confidence = max(Config.CONFIDENCE_FLOOR, min(abs(enhanced_edge) / Config.EDGE_SCALE, 1.0))
+            size = max(Config.MIN_ORDER_SIZE, int(round(Config.BASE_ORDER_SIZE * confidence)))
             
-            # --- 2. Dynamic Size & Confidence ---
-            confidence = max(Config.CONFIDENCE_FLOOR, min(abs(edge) / Config.EDGE_SCALE, 1.0))
-            raw_size = Config.BASE_ORDER_SIZE * confidence
-            if vol > Config.VOL_GUARD_THRESHOLD:
-                raw_size *= Config.VOL_SIZE_REDUCTION
+            # --- 3. Strengthened Skew Logic ---
+            # Power of 2 skew for faster flattening
+            skew = -math.copysign((pos / limit) ** 2, pos) * Config.SKEW_FACTOR
+            if product == "EMERALDS": skew = 0
             
-            size = max(Config.MIN_ORDER_SIZE, int(round(raw_size)))
-            
-            # --- 3. Quoting Logic (Relaxed) ---
-            bid_price, ask_price = self._get_quotes(product, edge, best_bid, best_ask, fair, pos, limit)
-            
-            # --- 4. Momentum Filtering (Soft) ---
-            buy_size = min(limit - pos, size)
-            sell_size = max(-(limit + pos), -size)
-            
-            if buy_size > 0 and momentum < -0.4:
-                buy_size = max(Config.MIN_ORDER_SIZE, int(buy_size * 0.6))
-            if sell_size < 0 and momentum > 0.4:
-                sell_size = min(-Config.MIN_ORDER_SIZE, int(sell_size * 0.6))
+            # --- 4. Quoting Engine (Core MM) ---
+            if enhanced_edge > Config.STRONG_THRESHOLD:   bid_p = best_bid + 1
+            elif enhanced_edge > Config.WEAK_THRESHOLD:   bid_p = best_bid
+            else:                                         bid_p = best_bid - 1
+                
+            if enhanced_edge < -Config.STRONG_THRESHOLD:  ask_p = best_ask - 1
+            elif enhanced_edge < -Config.WEAK_THRESHOLD:  ask_p = best_ask
+            else:                                         ask_p = best_ask + 1
 
-            # --- 5. Hard Risk Control ---
+            # Apply Inventory Skew
+            bid_p += int(math.floor(skew))
+            ask_p += int(math.ceil(skew))
+
+            # --- 5. Hard Position Control (FLATTEN) ---
             if abs(pos) >= limit * Config.LIQUIDATION_THRESHOLD:
+                print(f"[{product}] FLATTENING: {pos} exceeds limit threshold.")
                 if pos > 0: orders.append(Order(product, best_bid, -pos))
                 else: orders.append(Order(product, best_ask, abs(pos)))
                 result[product] = orders
                 continue
 
-            # --- 6. Execution ---
-            if buy_size > 0:
-                orders.append(Order(product, bid_price, buy_size))
-            if sell_size < 0:
-                orders.append(Order(product, ask_price, sell_size))
+            # Core Passive MM Orders
+            can_buy = limit - pos
+            can_sell = -(limit + pos)
+            
+            if can_buy > 0: orders.append(Order(product, bid_p, min(can_buy, size)))
+            if can_sell < 0: orders.append(Order(product, ask_p, max(can_sell, -size)))
                 
-            # --- 7. Aggressive Taker Logic (Relaxed) ---
-            edge_vs_ask = fair - best_ask
-            edge_vs_bid = best_bid - fair
+            # --- 6. Controlled Aggression ---
+            # Use trend only for deciding aggression tier
+            abs_trend = abs(trend)
+            is_strong_trend = abs_trend > Config.SEMI_AGGR_TREND_THRESHOLD
             
-            aggr_buy = edge_vs_ask > Config.ALPHA_AGGR_VALUE_THRESHOLD or (momentum > Config.MOMENTUM_AGGR_THRESHOLD and edge_vs_ask > 0)
-            aggr_sell = edge_vs_bid > Config.ALPHA_AGGR_VALUE_THRESHOLD or (momentum < -Config.MOMENTUM_AGGR_THRESHOLD and edge_vs_bid > 0)
-            
-            if aggr_buy and (limit - pos) > 0:
-                orders.append(Order(product, best_ask, min(limit - pos, 5)))
-            if aggr_sell and (limit + pos) > 0:
-                orders.append(Order(product, best_bid, -min(limit + pos, 5)))
+            # Aggressive trades only if there's real value
+            edge_only = fair - mid
+            if (edge_only > Config.ALPHA_AGGR_THRESHOLD) or (is_strong_trend and edge_only > 0.5):
+                t_qty = min(can_buy // 2, 8)
+                if t_qty > 0: orders.append(Order(product, best_ask, t_qty))
+            elif (edge_only < -Config.ALPHA_AGGR_THRESHOLD) or (is_strong_trend and edge_only < -0.5):
+                t_qty = min(abs(can_sell) // 2, 8)
+                if t_qty > 0: orders.append(Order(product, best_bid, -t_qty))
 
-            print(f"[{state.timestamp}] {product:10} | E:{edge:5.2f} | M:{momentum:5.2f} | P:{pos:4} | Sz:{size:2} | Decision: PASSIVE + AGGR={aggr_buy or aggr_sell}")
             result[product] = orders
             
         return result, conversions, state.traderData
-
-    def _get_quotes(self, product, edge, best_bid, best_ask, fair, pos, limit) -> Tuple[int, int]:
-        skew = -math.copysign((abs(pos) / limit) ** 1.2, pos) * Config.SKEW_FACTOR
-        if product == "EMERALDS": skew = 0
-        
-        # Base bid
-        if edge > Config.STRONG_THRESHOLD:
-            bid = best_bid + 1
-        elif edge > Config.WEAK_THRESHOLD:
-            bid = best_bid
-        else:
-            bid = best_bid - 1
-            
-        # Base ask
-        if edge < -Config.STRONG_THRESHOLD:
-            ask = best_ask - 1
-        elif edge < -Config.WEAK_THRESHOLD:
-            ask = best_ask
-        else:
-            ask = best_ask + 1
-            
-        return int(bid + skew), int(ask + skew)
 
     def _get_ob_stats(self, depth: OrderDepth) -> Tuple[float, float]:
         b = sorted(depth.buy_orders.items(), reverse=True)[:Config.LEVELS_TO_CONSIDER]
@@ -180,5 +161,5 @@ class Trader:
         for p, v in s:
             av = abs(v); t_val += p * av; t_vol += av; a_vol += av
         vwap = t_val / t_vol if t_vol > 0 else 0.0
-        imb = (b_vol - a_vol) / (b_vol + a_vol + Config.EPSILON)
+        imb = (b_vol - a_vol) / (b_vol+a_vol+Config.EPSILON)
         return vwap, imb
