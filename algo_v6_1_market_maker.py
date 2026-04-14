@@ -78,8 +78,12 @@ class Trader:
             
             # --- 3. Dynamic Spread ---
             spread = Config.BASE_SPREAD + 1.5 * volatility + 0.8 * (abs(pos) / limit)
-            size_b = Config.BASE_SIZE
-            size_s = Config.BASE_SIZE
+            
+            # Scale Base Size relative to limits
+            scale = limit / 20.0
+            base_size = int(Config.BASE_SIZE * scale)
+            size_b = base_size
+            size_s = base_size
             
             # --- 11. Volatility Control ---
             if volatility > Config.VOLA_THRESHOLD:
@@ -137,8 +141,7 @@ class Trader:
             # --- 9. Inventory Reduction (Hard Cap) ---
             hard_cap = limit * Config.HARD_CAP_RATIO
             if abs(pos) > hard_cap:
-                orders = [] # Clear standard orders
-                reduction = int(limit * 0.25)
+                reduction = int(limit * 0.2)
                 if pos > 0: orders.append(Order(prod, best_bid, -reduction))
                 else: orders.append(Order(prod, best_ask, reduction))
 
